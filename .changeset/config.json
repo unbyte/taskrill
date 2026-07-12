@@ -1,0 +1,11 @@
+{
+  "$schema": "https://unpkg.com/@changesets/config/schema.json",
+  "changelog": "@changesets/cli/changelog",
+  "commit": ["./message.js", {}],
+  "fixed": [],
+  "baseBranch": "main",
+  "updateInternalDependencies": "patch",
+  "privatePackages": {
+    "version": false
+  }
+}
