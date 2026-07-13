@@ -64,13 +64,46 @@ export interface Unit {
   readonly done: Promise<Settlement>
 }
 
+/**
+ * A unit that accepts exactly one task submission. Conceptually a {@link Group}
+ * with a maximum capacity of one and automatic sealing: its first `submit()`
+ * seals it, and `skip()` seals it empty. Its `done` resolves once that one task
+ * is terminal, or immediately when skipped.
+ */
 export interface Single<I = void> extends Unit {
+  /**
+   * Submits the single's one task and seals it in the same call. Throws
+   * {@link SealedUnitError} synchronously if the single was already submitted or
+   * skipped; a silent no-op after an abort.
+   */
   submit(...args: SubmitArgs<I>): void
+  /**
+   * Seals the single empty without running it, so its `done` resolves with all
+   * counts at `0`. Idempotent, but throws {@link SealedUnitError} after a
+   * `submit()`; a silent no-op after an abort. Use it to give a conditional
+   * terminal single a terminal state so a top-level `await done` cannot hang.
+   */
   skip(): void
 }
 
+/**
+ * A unit representing a dynamically growing set of tasks. Each `submit()` adds
+ * one task that may start immediately; an explicit `seal()` finalizes the set,
+ * after which the group settles once every submitted task is terminal.
+ */
 export interface Group<I = void> extends Unit {
+  /**
+   * Adds one task to the group and schedules it for asynchronous execution.
+   * Non-blocking and returns nothing — the handler never runs inline. Throws
+   * {@link SealedUnitError} synchronously if the group is already sealed; a
+   * silent no-op after an abort.
+   */
   submit(...args: SubmitArgs<I>): void
+  /**
+   * Declares that the group will accept no further submissions. Does not wait
+   * for running tasks — settlement follows once every submitted task drains.
+   * Idempotent; an empty sealed group settles immediately.
+   */
   seal(): void
 }
 
