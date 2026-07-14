@@ -29,6 +29,17 @@ export interface Scheduler {
 const NEVER_ABORT: AbortSignal = new AbortController().signal
 
 /**
+ * Guards a concurrency limit: it must be an integer `>= 1` or `Infinity`. Shared
+ * by the Runtime's global limit and a group's per-group limit; `label` names the
+ * offending value in the thrown message.
+ */
+export function assertValidConcurrency(value: number, label = 'concurrency'): void {
+  if (value !== Number.POSITIVE_INFINITY && !(Number.isInteger(value) && value >= 1)) {
+    throw new RangeError(`${label} must be an integer >= 1 or Infinity, got ${value}`)
+  }
+}
+
+/**
  * A queue-driven, FIFO, stack-safe dispatcher enforcing a single global
  * concurrency limit, and the owner of the abort lifecycle. `enqueue()` never
  * invokes a job inline — dispatch is always deferred to a microtask, so a
@@ -50,9 +61,7 @@ export class SchedulerImpl implements Scheduler {
   private pumpScheduled = false
 
   constructor(concurrency: number, signal?: AbortSignal, onError?: (failure: TaskFailure) => void) {
-    if (concurrency !== Number.POSITIVE_INFINITY && !(Number.isInteger(concurrency) && concurrency >= 1)) {
-      throw new RangeError(`concurrency must be an integer >= 1 or Infinity, got ${concurrency}`)
-    }
+    assertValidConcurrency(concurrency)
     this.concurrency = concurrency
     this.signal = signal
     this.onError = onError
@@ -67,9 +76,13 @@ export class SchedulerImpl implements Scheduler {
     return this.signal?.aborted ?? false
   }
 
-  /** Registers a unit to be force-sealed if the signal aborts. */
-  track(unit: { forceSeal(): void }): void {
-    this.units.add(unit)
+  /**
+   * Registers a participant to be force-sealed if the signal aborts. On abort
+   * each participant's `forceSeal()` runs before the queue drains, in
+   * registration order.
+   */
+  track(participant: { forceSeal(): void }): void {
+    this.units.add(participant)
   }
 
   enqueue(job: Job) {

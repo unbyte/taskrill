@@ -26,6 +26,13 @@ export interface UnitOptions {
 
 export interface GroupOptions<I = void> extends UnitOptions {
   /**
+   * Caps how many of *this group's* handlers run simultaneously, independent of
+   * every other unit. Must be an integer `>= 1` or `Infinity`. Clipped to the
+   * Runtime's `concurrency`: a value at or above it imposes no extra limit.
+   * Omit for no per-group limit — the group is then bounded only by the Runtime.
+   */
+  concurrency?: number
+  /**
    * Fires synchronously on each open `pending -> 0` transition, after the first
    * submission and never once sealed. Meant for the self-fed recursive fan-out
    * pattern, where the callback seals the group. Fire-and-forget.

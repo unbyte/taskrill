@@ -23,9 +23,15 @@ const Resize = runtime.group<string>(async (file, { signal }) => {
   await resizeImage(file, { signal })
 })
 
-const Thumbnail = runtime.group<string>(async (file, { signal }) => {
-  await makeThumbnail(file, { signal })
-})
+// A group can take its own `concurrency` to throttle just this stage — say the
+// thumbnail service is rate-limited. It only ever restricts: the value is
+// clipped to the runtime's, so at most 2 thumbnails run at once here.
+const Thumbnail = runtime.group<string>(
+  async (file, { signal }) => {
+    await makeThumbnail(file, { signal })
+  },
+  { concurrency: 2 },
+)
 
 // Wire the seal graph: run Report once both groups have settled.
 join(Resize, Thumbnail).then((s) => (s.ok ? Report.submit() : Report.skip()))
@@ -45,7 +51,7 @@ await Report.done
 | API | Description |
 | --- | --- |
 | `new Runtime(options)` | One in-process scheduling environment: task queue, global `concurrency` limit, execution, and failure reporting. |
-| `runtime.group(handler, options?)` | Creates a dynamically growing set of tasks. `submit(input)` adds work (non-blocking); `seal()` declares the set final. |
+| `runtime.group(handler, options?)` | Creates a dynamically growing set of tasks. `submit(input)` adds work (non-blocking); `seal()` declares the set final. Pass `concurrency` for a per-group limit. |
 | `runtime.single(handler, options?)` | A group capped at one task with auto-sealing. `submit()` runs it once; `skip()` seals it empty. |
 | `join(...units)` | Awaits several units and reduces their settlements into one, so a downstream unit can be sealed after multiple upstreams settle. |
 | `unit` | A unit is a group or a single — the two kinds of task set a runtime creates. |
