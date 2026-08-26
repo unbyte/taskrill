@@ -1,53 +1,70 @@
 import { describe, expect, it } from 'vitest'
-import { type Job, SchedulerImpl } from './scheduler'
-import type { Unit } from './types'
+import { Emitter } from './emitter'
+import { type Job, Scheduler } from './scheduler'
+import type { RuntimeEventMap } from './types'
 
-/** Resolves after the entire pending microtask cascade has drained. */
-const flush = () => new Promise((resolve) => setTimeout(resolve, 0))
+const flush = () => new Promise<void>((resolve) => setTimeout(resolve, 0))
 
-const noopJob = (run: () => Promise<void> | void, cancel: () => void = () => {}): Job => ({
-  run: () => Promise.resolve(run()),
-  cancel,
+const accept = (scheduler: Scheduler, job: Job, published: number[] = []) => {
+  scheduler.accept(scheduler, (id) => ({
+    job,
+    publish: () => published.push(id),
+  }))
+}
+
+const immediateJob = (run: () => void = () => {}): Job => ({
+  run: async () => run(),
+  cancel: () => {},
 })
 
-describe('SchedulerImpl', () => {
-  it('never invokes a job inline during enqueue', () => {
-    const s = new SchedulerImpl(1)
-    let ran = false
-    s.enqueue(
-      noopJob(() => {
-        ran = true
-      }),
+describe('Scheduler', () => {
+  it('validates global concurrency', () => {
+    const events = new Emitter<RuntimeEventMap>()
+    expect(() => new Scheduler(0, undefined, events)).toThrow(RangeError)
+    expect(() => new Scheduler(-1, undefined, events)).toThrow(RangeError)
+    expect(() => new Scheduler(1.5, undefined, events)).toThrow(RangeError)
+    expect(() => new Scheduler(Number.NaN, undefined, events)).toThrow(RangeError)
+    expect(() => new Scheduler(1, undefined, events)).not.toThrow()
+    expect(() => new Scheduler(Number.POSITIVE_INFINITY, undefined, events)).not.toThrow()
+  })
+
+  it('publishes task IDs synchronously but dispatches jobs later in FIFO order', async () => {
+    const scheduler = new Scheduler(1, undefined, new Emitter())
+    const published: number[] = []
+    const ran: number[] = []
+
+    accept(
+      scheduler,
+      immediateJob(() => ran.push(1)),
+      published,
     )
-    expect(ran).toBe(false)
-  })
+    accept(
+      scheduler,
+      immediateJob(() => ran.push(2)),
+      published,
+    )
 
-  it('dispatches in FIFO order', async () => {
-    const s = new SchedulerImpl(1)
-    const order: number[] = []
-    for (let i = 0; i < 6; i++) s.enqueue(noopJob(() => void order.push(i)))
+    expect(published).toEqual([1, 2])
+    expect(ran).toEqual([])
+
     await flush()
-    expect(order).toEqual([0, 1, 2, 3, 4, 5])
+    expect(ran).toEqual([1, 2])
   })
 
-  it('never exceeds the configured concurrency', async () => {
-    const concurrency = 3
-    const total = 12
-    const s = new SchedulerImpl(concurrency)
+  it('enforces the global concurrency limit', async () => {
+    const scheduler = new Scheduler(3, undefined, new Emitter())
+    const releases: Array<() => void> = []
     let active = 0
     let peak = 0
-    let completed = 0
-    const release: Array<() => void> = []
 
-    for (let i = 0; i < total; i++) {
-      s.enqueue({
+    for (let index = 0; index < 9; index++) {
+      accept(scheduler, {
         run: () => {
           active++
           peak = Math.max(peak, active)
           return new Promise<void>((resolve) => {
-            release.push(() => {
+            releases.push(() => {
               active--
-              completed++
               resolve()
             })
           })
@@ -57,108 +74,67 @@ describe('SchedulerImpl', () => {
     }
 
     await flush()
-    expect(active).toBe(concurrency)
+    expect(active).toBe(3)
 
-    for (let i = 0; i < total; i++) {
-      expect(release.length).toBeGreaterThan(0)
-      release.shift()?.()
+    while (releases.length > 0) {
+      releases.shift()?.()
       await flush()
     }
 
-    expect(completed).toBe(total)
-    expect(peak).toBe(concurrency)
+    expect(peak).toBe(3)
   })
 
-  it('runs everything under Infinity concurrency', async () => {
-    const s = new SchedulerImpl(Number.POSITIVE_INFINITY)
-    let active = 0
-    let peak = 0
-    let completed = 0
-    const release: Array<() => void> = []
-    const total = 50
-
-    for (let i = 0; i < total; i++) {
-      s.enqueue({
-        run: () => {
-          active++
-          peak = Math.max(peak, active)
-          return new Promise<void>((resolve) =>
-            release.push(() => {
-              active--
-              completed++
-              resolve()
-            }),
-          )
-        },
-        cancel: () => {},
-      })
-    }
+  it('emits idle only after an accepted workload drains', async () => {
+    const events = new Emitter<RuntimeEventMap>()
+    const scheduler = new Scheduler(1, undefined, events)
+    const idle: string[] = []
+    events.on('idle', () => idle.push('idle'))
 
     await flush()
-    expect(peak).toBe(total) // every job started at once
-    for (const r of release) r()
+    expect(idle).toEqual([])
+
+    accept(scheduler, immediateJob())
     await flush()
-    expect(completed).toBe(total)
+    expect(idle).toEqual(['idle'])
   })
 
-  it('drops queued jobs without running them when the signal aborts', async () => {
-    const ac = new AbortController()
-    const s = new SchedulerImpl(1, ac.signal)
-    const ran: number[] = []
+  it('cancels queued jobs and suppresses idle after abort', async () => {
+    const abortController = new AbortController()
+    const events = new Emitter<RuntimeEventMap>()
+    const scheduler = new Scheduler(1, abortController.signal, events)
     const cancelled: number[] = []
-    let releaseFirst!: () => void
-    const firstDone = new Promise<void>((resolve) => {
-      releaseFirst = resolve
+    const idle: string[] = []
+    let release!: () => void
+    const running = new Promise<void>((resolve) => {
+      release = resolve
     })
 
-    s.enqueue({
-      run: () => {
-        ran.push(0)
-        return firstDone
-      },
-      cancel: () => cancelled.push(0),
-    })
-    for (let i = 1; i < 4; i++) {
-      s.enqueue({
-        run: async () => void ran.push(i),
-        cancel: () => cancelled.push(i),
-      })
+    events.on('idle', () => idle.push('idle'))
+    accept(scheduler, { run: () => running, cancel: () => cancelled.push(0) })
+    for (let id = 1; id < 4; id++) {
+      accept(scheduler, { run: async () => {}, cancel: () => cancelled.push(id) })
     }
 
     await flush()
-    expect(ran).toEqual([0]) // only the first fits the single slot
-
-    ac.abort()
-    releaseFirst()
+    abortController.abort()
+    release()
     await flush()
 
-    expect(ran).toEqual([0]) // queued jobs never ran
     expect(cancelled).toEqual([1, 2, 3])
+    expect(idle).toEqual([])
   })
 
-  it('remains stack-safe under a large backlog', async () => {
-    const s = new SchedulerImpl(Number.POSITIVE_INFINITY)
-    let count = 0
-    const n = 100_000
-    for (let i = 0; i < n; i++) s.enqueue(noopJob(() => void count++))
-    await flush()
-    expect(count).toBe(n)
-  })
+  it('does not create a task when constructed with an aborted signal', () => {
+    const abortController = new AbortController()
+    abortController.abort()
+    const scheduler = new Scheduler(1, abortController.signal, new Emitter())
+    let created = false
 
-  it('re-throws a thrown onError on a fresh microtask without corrupting bookkeeping', () => {
-    const boom = new Error('observer boom')
-    const s = new SchedulerImpl(1, undefined, () => {
-      throw boom
+    scheduler.accept(scheduler, () => {
+      created = true
+      return { job: immediateJob(), publish: () => {} }
     })
-    const deferred: Array<() => void> = []
-    const real = globalThis.queueMicrotask
-    globalThis.queueMicrotask = (cb: () => void) => void deferred.push(cb)
-    try {
-      s.reportError({ error: new Error('task'), unit: {} as unknown as Unit, input: undefined })
-      expect(deferred).toHaveLength(1)
-      expect(() => deferred[0]()).toThrow(boom)
-    } finally {
-      globalThis.queueMicrotask = real
-    }
+
+    expect(created).toBe(false)
   })
 })

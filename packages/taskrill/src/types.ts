@@ -1,120 +1,90 @@
 export type MaybePromise<T> = T | Promise<T>
 
+export type Unsubscribe = () => void
+
 export interface RuntimeOptions {
-  /**
-   * Maximum number of handlers executing simultaneously across the whole
-   * Runtime. Must be an integer `>= 1` or `Infinity`. Required, no default.
-   */
+  /** Maximum handlers running across the runtime. Must be a positive integer or `Infinity`. */
   concurrency: number
-  /**
-   * Cancellation is observed, never originated. When this signal aborts every
-   * unit is force-sealed and every not-yet-started task terminalizes as
-   * `cancelled`.
-   */
+  /** Once aborted, queued tasks are cancelled and future submissions are ignored. */
   signal?: AbortSignal
-  /**
-   * Called exactly once per failed task. Fire-and-forget: a returned promise is
-   * ignored. Not called for cancelled tasks.
-   */
-  onError?: (failure: TaskFailure) => void
 }
 
-export interface UnitOptions {
-  /** Overrides the auto-generated `kind#id` display name. Debugging metadata only. */
+export interface TaskNodeOptions {
+  /** Overrides the generated `node#id` debugging name. */
   name?: string
-}
-
-export interface GroupOptions<I = void> extends UnitOptions {
-  /**
-   * Caps how many of *this group's* handlers run simultaneously, independent of
-   * every other unit. Must be an integer `>= 1` or `Infinity`. Clipped to the
-   * Runtime's `concurrency`: a value at or above it imposes no extra limit.
-   * Omit for no per-group limit — the group is then bounded only by the Runtime.
-   */
+  /** Optional concurrency cap for this node. Must be a positive integer or `Infinity`. */
   concurrency?: number
-  /**
-   * Fires synchronously on each open `pending -> 0` transition, after the first
-   * submission and never once sealed. Meant for the self-fed recursive fan-out
-   * pattern, where the callback seals the group. Fire-and-forget.
-   */
-  onIdle?: (unit: Group<I>) => void
 }
 
 export interface TaskContext {
-  /** The Runtime's signal, or a never-aborting placeholder when none is provided. */
+  /** The runtime signal, or a never-aborting signal when the runtime has none. */
   readonly signal: AbortSignal
 }
 
 export type Handler<I> = (input: I, context: TaskContext) => MaybePromise<void>
 
-export interface TaskFailure {
-  readonly error: unknown
-  readonly unit: Unit
-  readonly input: unknown
-}
-
-export interface Settlement {
-  readonly submitted: number
-  readonly succeeded: number
-  readonly failed: number
-  readonly cancelled: number
-
-  /** `true` exactly when `failed === 0 && cancelled === 0`. Derived convenience. */
-  readonly ok: boolean
-}
-
-export interface Unit {
+export interface TaskNodeRef {
+  /** Unique among nodes created by the runtime. */
   readonly id: number
+  /** Human-readable diagnostic label. It is not required to be unique. */
   readonly name: string
-
-  /** Resolves once the unit is sealed and every submitted task is terminal. Never rejects. */
-  readonly done: Promise<Settlement>
 }
 
-/**
- * A unit that accepts exactly one task submission. Conceptually a {@link Group}
- * with a maximum capacity of one and automatic sealing: its first `submit()`
- * seals it, and `skip()` seals it empty. Its `done` resolves once that one task
- * is terminal, or immediately when skipped.
- */
-export interface Single<I = void> extends Unit {
-  /**
-   * Submits the single's one task and seals it in the same call. Throws
-   * {@link SealedUnitError} synchronously if the single was already submitted or
-   * skipped; a silent no-op after an abort.
-   */
+export interface TaskEvent<I> {
+  /** Runtime-wide task identity, shared by all lifecycle events for this submission. */
+  readonly id: number
+  /** Node that accepted and owns the task. */
+  readonly node: TaskNode<I>
+  /** Value passed to `submit`; object identity is preserved. */
+  readonly input: I
+}
+
+export interface TaskFailureEvent<I> extends TaskEvent<I> {
+  /** Value thrown by or rejected from the handler. */
+  readonly error: unknown
+}
+
+export interface RuntimeTaskFailureEvent {
+  /** Runtime-wide identity of the failed task. */
+  readonly id: number
+  /** Identity of the node whose handler failed. */
+  readonly node: TaskNodeRef
+  /** Submitted input, typed as `unknown` because a runtime can contain heterogeneous nodes. */
+  readonly input: unknown
+  /** Value thrown by or rejected from the handler. */
+  readonly error: unknown
+}
+
+export interface TaskNodeEventMap<I> {
+  /** Emitted synchronously after `submit` is accepted and before the task can start. */
+  'task:submit': TaskEvent<I>
+  /** Emitted immediately before the handler runs, after concurrency limits admit the task. */
+  'task:start': TaskEvent<I>
+  /** Emitted after the handler returns or resolves. */
+  'task:complete': TaskEvent<I>
+  /** Emitted after the handler throws or rejects, before the runtime failure event. */
+  'task:failure': TaskFailureEvent<I>
+  /** Emitted when abort cancels an accepted task before it starts. Running tasks are not cancelled. */
+  'task:cancel': TaskEvent<I>
+}
+
+export interface RuntimeEventMap {
+  /** Emitted for every failed task, after that node's failure event. */
+  'task:failure': RuntimeTaskFailureEvent
+  /** Emitted after accepted work drains to zero. It can recur and is suppressed after abort. */
+  idle: undefined
+}
+
+export interface TaskNode<I = void> extends TaskNodeRef {
+  /** Accepts a task for deferred execution. A submission after abort is ignored. */
   submit(...args: SubmitArgs<I>): void
-  /**
-   * Seals the single empty without running it, so its `done` resolves with all
-   * counts at `0`. Idempotent, but throws {@link SealedUnitError} after a
-   * `submit()`; a silent no-op after an abort. Use it to give a conditional
-   * terminal single a terminal state so a top-level `await done` cannot hang.
-   */
-  skip(): void
+
+  on<K extends keyof TaskNodeEventMap<I>>(
+    event: K,
+    listener: (event: TaskNodeEventMap<I>[K]) => void,
+  ): Unsubscribe
 }
 
-/**
- * A unit representing a dynamically growing set of tasks. Each `submit()` adds
- * one task that may start immediately; an explicit `seal()` finalizes the set,
- * after which the group settles once every submitted task is terminal.
- */
-export interface Group<I = void> extends Unit {
-  /**
-   * Adds one task to the group and schedules it for asynchronous execution.
-   * Non-blocking and returns nothing — the handler never runs inline. Throws
-   * {@link SealedUnitError} synchronously if the group is already sealed; a
-   * silent no-op after an abort.
-   */
-  submit(...args: SubmitArgs<I>): void
-  /**
-   * Declares that the group will accept no further submissions. Does not wait
-   * for running tasks — settlement follows once every submitted task drains.
-   * Idempotent; an empty sealed group settles immediately.
-   */
-  seal(): void
-}
-
-// `void` (not `undefined`) is deliberate: it lets a `Single<void>`/`Group<void>`
-// be submitted with no argument, while a typed input stays required.
+// `void` lets a no-input node use `submit()` while preserving required typed inputs.
 // biome-ignore lint/suspicious/noConfusingVoidType: intentional void-vs-typed input discrimination
 export type SubmitArgs<I> = [I] extends [void] ? [] | [input: I] : [input: I]

@@ -1,74 +1,62 @@
-import type { TaskContext, TaskFailure } from './types'
+import type { Emitter } from './emitter'
+import { FifoQueue } from './fifo'
+import type { RuntimeEventMap, RuntimeTaskFailureEvent, TaskContext, Unsubscribe } from './types'
 
-/**
- * A unit of executable work handed to the {@link SchedulerImpl}. `run()` never
- * rejects — it captures handler success and failure internally and resolves
- * once the task's bookkeeping is complete. `cancel()` terminalizes a task that
- * never started (dropped from the queue on abort).
- */
 export interface Job {
+  /** Resolves after the task's terminal lifecycle event has been emitted. */
   run(): Promise<void>
+  /** Terminalizes a task that has not started. */
   cancel(): void
 }
 
-/**
- * The scheduler surface a unit depends on: somewhere to enqueue its jobs and
- * report failures, plus the abort state and shared context it needs while
- * running. A unit is coupled to this narrow view, never to {@link SchedulerImpl}.
- */
-export interface Scheduler {
-  /** True once the observed signal has aborted. */
-  readonly aborted: boolean
-  /** The shared context handed to every handler (carries the signal). */
-  readonly context: TaskContext
+export interface JobQueue {
   enqueue(job: Job): void
-  reportError(failure: TaskFailure): void
 }
 
-/** A signal that never aborts, used for the context when the scheduler has none. */
-const NEVER_ABORT: AbortSignal = new AbortController().signal
+export interface TaskDefinition {
+  readonly job: Job
+  readonly publish: () => void
+}
 
-/**
- * Guards a concurrency limit: it must be an integer `>= 1` or `Infinity`. Shared
- * by the Runtime's global limit and a group's per-group limit; `label` names the
- * offending value in the thrown message.
- */
-export function assertValidConcurrency(value: number, label = 'concurrency'): void {
+export interface AbortableQueue {
+  abort(): void
+}
+
+const NEVER_ABORT = new AbortController().signal
+
+export function assertValidConcurrency(value: number, label = 'concurrency') {
   if (value !== Number.POSITIVE_INFINITY && !(Number.isInteger(value) && value >= 1)) {
     throw new RangeError(`${label} must be an integer >= 1 or Infinity, got ${value}`)
   }
 }
 
-/**
- * A queue-driven, FIFO, stack-safe dispatcher enforcing a single global
- * concurrency limit, and the owner of the abort lifecycle. `enqueue()` never
- * invokes a job inline — dispatch is always deferred to a microtask, so a
- * handler can never run within the `submit()` that scheduled it.
- *
- * When the observed signal aborts, every tracked unit is force-sealed before
- * the queue drains, and every not-yet-started task terminalizes as cancelled.
- */
-export class SchedulerImpl implements Scheduler {
+/** Global FIFO dispatcher and owner of task acceptance, abort, and idle accounting. */
+export class Scheduler implements JobQueue {
   readonly context: TaskContext
 
-  private readonly concurrency: number
-  private readonly signal?: AbortSignal
-  private readonly onError?: (failure: TaskFailure) => void
-  private readonly units = new Set<{ forceSeal(): void }>()
-  private readonly queue: Job[] = []
-  private head = 0
-  private running = 0
+  private readonly queue = new FifoQueue<Job>()
+  private readonly abortableQueues = new Set<AbortableQueue>()
+  private nextTaskId = 1
+  private pendingTasks = 0
+  private runningJobs = 0
+  private activityGeneration = 0
+  private idleCandidateGeneration?: number
   private pumpScheduled = false
+  private idleScheduled = false
+  private lifecycleDepth = 0
+  private abortRequested = false
+  private aborting = false
 
-  constructor(concurrency: number, signal?: AbortSignal, onError?: (failure: TaskFailure) => void) {
+  constructor(
+    private readonly concurrency: number,
+    private readonly signal: AbortSignal | undefined,
+    private readonly events: Emitter<RuntimeEventMap>,
+  ) {
     assertValidConcurrency(concurrency)
-    this.concurrency = concurrency
-    this.signal = signal
-    this.onError = onError
     this.context = { signal: signal ?? NEVER_ABORT }
 
     if (signal && !signal.aborted) {
-      signal.addEventListener('abort', () => this.onAbort(), { once: true })
+      signal.addEventListener('abort', () => this.requestAbort(), { once: true })
     }
   }
 
@@ -76,52 +64,100 @@ export class SchedulerImpl implements Scheduler {
     return this.signal?.aborted ?? false
   }
 
-  /**
-   * Registers a participant to be force-sealed if the signal aborts. On abort
-   * each participant's `forceSeal()` runs before the queue drains, in
-   * registration order.
-   */
-  track(participant: { forceSeal(): void }): void {
-    this.units.add(participant)
+  accept(queue: JobQueue, createTask: (id: number) => TaskDefinition) {
+    if (this.aborted) return
+
+    const task = createTask(this.nextTaskId++)
+    this.pendingTasks++
+    this.activityGeneration++
+    this.idleCandidateGeneration = undefined
+    queue.enqueue(this.track(task.job))
+    this.emitLifecycle(task.publish)
   }
 
   enqueue(job: Job) {
+    if (this.aborted) {
+      job.cancel()
+      return
+    }
+
     this.queue.push(job)
     this.schedulePump()
   }
 
-  reportError(failure: TaskFailure) {
-    if (!this.onError) return
+  emitLifecycle(emit: () => void) {
+    this.lifecycleDepth++
     try {
-      this.onError(failure)
-    } catch (error) {
-      // If onError itself throws, re-throw on a fresh microtask so the bug
-      // surfaces loudly without disturbing scheduler bookkeeping.
-      queueMicrotask(() => {
-        throw error
-      })
+      emit()
+    } finally {
+      this.lifecycleDepth--
+      this.flushAbort()
     }
   }
 
-  private onAbort() {
-    // Force-seal every tracked unit before draining, so a pending -> 0
-    // transition during teardown settles the unit rather than firing onIdle.
-    for (const unit of this.units) unit.forceSeal()
-    // Every not-yet-started task terminalizes as cancelled.
-    this.cancelAll()
+  reportFailure(failure: RuntimeTaskFailureEvent) {
+    this.events.emit('task:failure', failure)
   }
 
-  /** Drops every not-yet-started job, terminalizing each as cancelled. */
-  private cancelAll() {
-    if (this.head >= this.queue.length) return
-    const dropped = this.queue.slice(this.head)
-    this.queue.length = 0
-    this.head = 0
-    for (const job of dropped) job.cancel()
+  registerAbortable(queue: AbortableQueue): Unsubscribe {
+    if (this.aborted) {
+      queue.abort()
+      return () => {}
+    }
+
+    this.abortableQueues.add(queue)
+    return () => {
+      this.abortableQueues.delete(queue)
+    }
+  }
+
+  private track(job: Job): Job {
+    let finished = false
+    const finish = () => {
+      if (finished) return
+      finished = true
+      this.pendingTasks--
+      if (this.pendingTasks === 0) this.idleCandidateGeneration = this.activityGeneration
+    }
+
+    return {
+      run: async () => {
+        try {
+          await job.run()
+        } finally {
+          finish()
+        }
+      },
+      cancel: () => {
+        try {
+          job.cancel()
+        } finally {
+          finish()
+        }
+      },
+    }
+  }
+
+  private requestAbort() {
+    this.abortRequested = true
+    this.flushAbort()
+  }
+
+  private flushAbort() {
+    if (!this.abortRequested || this.aborting || this.lifecycleDepth !== 0) return
+
+    this.aborting = true
+    try {
+      for (const queue of [...this.abortableQueues]) queue.abort()
+      for (const job of this.queue.drain()) job.cancel()
+    } finally {
+      this.abortRequested = false
+      this.aborting = false
+    }
   }
 
   private schedulePump() {
-    if (this.pumpScheduled) return
+    if (this.pumpScheduled || this.aborted) return
     this.pumpScheduled = true
     queueMicrotask(() => {
       this.pumpScheduled = false
@@ -130,32 +166,48 @@ export class SchedulerImpl implements Scheduler {
   }
 
   private pump() {
-    while (this.running < this.concurrency && this.head < this.queue.length) {
-      const job = this.queue[this.head]
-      // Release the reference so a large drained backlog can be collected.
-      this.queue[this.head] = undefined as unknown as Job
-      this.head++
-      this.dispatch(job)
-    }
-    this.compact()
-  }
+    if (this.aborted) return
 
-  private compact() {
-    if (this.head === 0) return
-    if (this.head >= this.queue.length) {
-      this.queue.length = 0
-      this.head = 0
-    } else if (this.head > 1024) {
-      this.queue.splice(0, this.head)
-      this.head = 0
+    while (this.runningJobs < this.concurrency) {
+      const job = this.queue.shift()
+      if (!job) break
+      this.dispatch(job)
     }
   }
 
   private dispatch(job: Job) {
-    this.running++
-    job.run().finally(() => {
-      this.running--
-      this.schedulePump()
+    this.runningJobs++
+    void job.run().then(
+      () => this.finishRunningJob(),
+      (error) => {
+        this.finishRunningJob()
+        queueMicrotask(() => {
+          throw error
+        })
+      },
+    )
+  }
+
+  private finishRunningJob() {
+    this.runningJobs--
+    this.schedulePump()
+    this.scheduleIdleCheckpoint()
+  }
+
+  private scheduleIdleCheckpoint() {
+    const generation = this.idleCandidateGeneration
+    if (generation === undefined || this.idleScheduled) return
+
+    this.idleScheduled = true
+    queueMicrotask(() => {
+      this.idleScheduled = false
+      if (this.aborted) return
+      if (this.pendingTasks !== 0) return
+      if (this.activityGeneration !== generation) return
+      if (this.idleCandidateGeneration !== generation) return
+
+      this.idleCandidateGeneration = undefined
+      this.events.emit('idle', undefined)
     })
   }
 }

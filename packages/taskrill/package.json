@@ -2,7 +2,7 @@
   "name": "taskrill",
   "version": "0.1.0",
   "type": "module",
-  "description": "Lightweight in-process task runtime for fine-grained async pipelines with dynamic fan-out.",
+  "description": "Lightweight in-process scheduler for event-driven task graphs.",
   "main": "src/index.ts",
   "files": [
     "lib"
