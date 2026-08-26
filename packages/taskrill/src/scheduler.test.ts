@@ -6,7 +6,7 @@ import type { RuntimeEventMap } from './types'
 const flush = () => new Promise<void>((resolve) => setTimeout(resolve, 0))
 
 const accept = (scheduler: Scheduler, job: Job, published: number[] = []) => {
-  scheduler.accept(scheduler, (id) => ({
+  return scheduler.accept(scheduler, (id) => ({
     job,
     publish: () => published.push(id),
   }))
@@ -33,17 +33,18 @@ describe('Scheduler', () => {
     const published: number[] = []
     const ran: number[] = []
 
-    accept(
+    const first = accept(
       scheduler,
       immediateJob(() => ran.push(1)),
       published,
     )
-    accept(
+    const second = accept(
       scheduler,
       immediateJob(() => ran.push(2)),
       published,
     )
 
+    expect([first, second]).toEqual([1, 2])
     expect(published).toEqual([1, 2])
     expect(ran).toEqual([])
 
@@ -98,6 +99,36 @@ describe('Scheduler', () => {
     expect(idle).toEqual(['idle'])
   })
 
+  it('gracefully closes after accepted work drains', async () => {
+    const scheduler = new Scheduler(1, undefined, new Emitter())
+    const ran: number[] = []
+
+    expect(
+      accept(
+        scheduler,
+        immediateJob(() => ran.push(1)),
+      ),
+    ).toBe(1)
+    expect(
+      accept(
+        scheduler,
+        immediateJob(() => ran.push(2)),
+      ),
+    ).toBe(2)
+    scheduler.close()
+
+    expect(scheduler.accepting).toBe(false)
+    expect(
+      accept(
+        scheduler,
+        immediateJob(() => ran.push(3)),
+      ),
+    ).toBeUndefined()
+
+    await scheduler.closed
+    expect(ran).toEqual([1, 2])
+  })
+
   it('cancels queued jobs and suppresses idle after abort', async () => {
     const abortController = new AbortController()
     const events = new Emitter<RuntimeEventMap>()
@@ -124,17 +155,19 @@ describe('Scheduler', () => {
     expect(idle).toEqual([])
   })
 
-  it('does not create a task when constructed with an aborted signal', () => {
+  it('does not create a task and starts closed when constructed with an aborted signal', async () => {
     const abortController = new AbortController()
     abortController.abort()
     const scheduler = new Scheduler(1, abortController.signal, new Emitter())
     let created = false
 
-    scheduler.accept(scheduler, () => {
+    const taskId = scheduler.accept(scheduler, () => {
       created = true
       return { job: immediateJob(), publish: () => {} }
     })
 
+    expect(taskId).toBeUndefined()
     expect(created).toBe(false)
+    await expect(scheduler.closed).resolves.toBeUndefined()
   })
 })

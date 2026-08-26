@@ -61,7 +61,8 @@ runtime.on('task:failure', ({ node, input, error }) => {
 })
 
 runtime.on('idle', () => {
-  if (!state.isComplete()) state.showAvailableRecoveryActions()
+  if (state.isComplete()) runtime.close()
+  else state.showAvailableRecoveryActions()
 })
 
 for (const file of await listFiles()) {
@@ -80,14 +81,23 @@ different nodes are correlated or which outcomes satisfy a dependency.
 | API | Description |
 | --- | --- |
 | `new Runtime(options)` | Creates a scheduler with a required global `concurrency` limit and optional `AbortSignal`. |
-| `runtime.node(handler, options?)` | Creates a reusable typed task node. `options.concurrency` can further limit that node. |
-| `node.submit(input)` | Accepts a task for deferred execution. It is non-blocking and returns no result. |
+| `runtime.node(handler, options?)` | Creates a reusable typed task node. `options.concurrency` can further limit that node. Throws after the runtime stops accepting work. |
+| `node.submit(input)` | Accepts a task and returns its runtime-wide ID, or `undefined` after close or abort. |
 | `node.on(event, listener)` | Observes typed submit, start, completion, failure, and cancellation facts synchronously. |
 | `runtime.on('task:failure', listener)` | Observes failures from every node for logging or runtime-wide policy. |
 | `runtime.on('idle', listener)` | Observes multi-shot transitions to zero pending tasks. Idleness is not graph completion. |
+| `runtime.close()` | Stops accepting new work while allowing accepted tasks to terminate normally. |
+| `runtime.closed` | Resolves after close or abort once every accepted task has terminated. |
 
-Queued tasks are cancelled when the runtime signal aborts. Running handlers are
-not forcibly stopped; they receive the same signal and settle normally.
+Use application state to decide when the graph is logically complete, then call
+`runtime.close()`—often from an `idle` listener—and await `runtime.closed` when
+shutdown observation is needed. Task failures emit node and runtime failure
+events but do not reject `runtime.closed`, stop scheduling, or produce automatic
+logging.
+
+Aborting the runtime signal also stops new work and cancels queued tasks.
+Running handlers are not forcibly stopped; they receive the same signal and
+settle normally before `runtime.closed` resolves.
 
 ## License
 

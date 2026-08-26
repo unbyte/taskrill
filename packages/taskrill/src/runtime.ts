@@ -13,6 +13,9 @@ import type {
 
 /** One scheduling environment shared by a dynamic graph of reusable task nodes. */
 export class Runtime {
+  /** Resolves after acceptance stops and every task terminates. Task failures do not reject it. */
+  readonly closed: Promise<void>
+
   private readonly events = new Emitter<RuntimeEventMap>()
   private readonly scheduler: Scheduler
   private readonly concurrency: number
@@ -22,12 +25,22 @@ export class Runtime {
     const { concurrency, signal } = options
     this.concurrency = concurrency
     this.scheduler = new Scheduler(concurrency, signal, this.events)
+    this.closed = this.scheduler.closed
   }
 
+  /** Creates a reusable task node. Throws after the runtime stops accepting work. */
   node<I = void>(handler: Handler<I>, options?: TaskNodeOptions): TaskNode<I> {
+    if (!this.scheduler.accepting)
+      throw new Error('Cannot create a task node after the runtime stops accepting work')
+
     const queue = this.queueFor(options?.concurrency)
     const id = this.nextNodeId++
     return new TaskNodeImpl(this.scheduler, queue, id, options?.name ?? `node#${id}`, handler)
+  }
+
+  /** Stops accepting nodes and tasks while allowing accepted tasks to terminate normally. */
+  close() {
+    this.scheduler.close()
   }
 
   on<K extends keyof RuntimeEventMap>(

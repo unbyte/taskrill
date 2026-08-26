@@ -24,7 +24,7 @@ export class TaskNodeImpl<I> implements TaskNode<I> {
 
   submit(...args: SubmitArgs<I>) {
     const input = args[0] as I
-    this.scheduler.accept(this.queue, (id) => this.createTask(id, input))
+    return this.scheduler.accept(this.queue, (id) => this.createTask(id, input))
   }
 
   on<K extends keyof TaskNodeEventMap<I>>(

@@ -37,13 +37,13 @@ describe('Runtime nodes', () => {
     const runtime = new Runtime({ concurrency: 2 })
     const seen: number[] = []
     const node = runtime.node<number>(async (input) => void seen.push(input))
+    let taskIds: Array<number | undefined> = []
 
     await runToIdle(runtime, () => {
-      node.submit(1)
-      node.submit(2)
-      node.submit(3)
+      taskIds = [node.submit(1), node.submit(2), node.submit(3)]
     })
 
+    expect(taskIds).toEqual([1, 2, 3])
     expect(seen).toEqual([1, 2, 3])
   })
 
@@ -97,6 +97,7 @@ describe('Task lifecycle events', () => {
     const runtime = new Runtime({ concurrency: 2 })
     const events: Array<{ event: string; id: number; input: string }> = []
     const node = runtime.node<string>(async () => {})
+    let taskIds: Array<number | undefined> = []
 
     for (const event of ['task:submit', 'task:start', 'task:complete'] as const) {
       node.on(event, (task) => {
@@ -106,10 +107,10 @@ describe('Task lifecycle events', () => {
     }
 
     await runToIdle(runtime, () => {
-      node.submit('first')
-      node.submit('second')
+      taskIds = [node.submit('first'), node.submit('second')]
     })
 
+    expect(taskIds).toEqual([1, 2])
     expect(events).toEqual([
       { event: 'task:submit', id: 1, input: 'first' },
       { event: 'task:submit', id: 2, input: 'second' },
@@ -151,6 +152,55 @@ describe('Task lifecycle events', () => {
 
     await runToIdle(runtime, () => node.submit())
     expect(order).toEqual(['node', 'runtime'])
+  })
+})
+
+describe('Runtime close', () => {
+  it('runs accepted work but rejects later nodes and submissions', async () => {
+    const runtime = new Runtime({ concurrency: 1 })
+    const completed: number[] = []
+    const cancelled: number[] = []
+    const node = runtime.node<number>(async (input) => void completed.push(input))
+    node.on('task:cancel', ({ input }) => cancelled.push(input))
+
+    expect(node.submit(1)).toBe(1)
+    expect(node.submit(2)).toBe(2)
+    runtime.close()
+
+    expect(node.submit(3)).toBeUndefined()
+    expect(() => runtime.node(async () => {})).toThrow(
+      'Cannot create a task node after the runtime stops accepting work',
+    )
+
+    await runtime.closed
+    expect(completed).toEqual([1, 2])
+    expect(cancelled).toEqual([])
+  })
+
+  it('resolves for an empty runtime and is idempotent', async () => {
+    const runtime = new Runtime({ concurrency: 1 })
+
+    runtime.close()
+    runtime.close()
+
+    await expect(runtime.closed).resolves.toBeUndefined()
+  })
+
+  it('resolves after failure events without rejecting', async () => {
+    const runtime = new Runtime({ concurrency: 1 })
+    const order: string[] = []
+    const node = runtime.node(async () => {
+      throw new Error('expected failure')
+    })
+    node.on('task:failure', () => order.push('node failure'))
+    runtime.on('task:failure', () => order.push('runtime failure'))
+    void runtime.closed.then(() => order.push('closed'))
+
+    node.submit()
+    runtime.close()
+
+    await expect(runtime.closed).resolves.toBeUndefined()
+    expect(order).toEqual(['node failure', 'runtime failure', 'closed'])
   })
 })
 
@@ -210,23 +260,23 @@ describe('Runtime abort', () => {
     node.on('task:submit', () => order.push('submit:second'))
     node.on('task:cancel', () => order.push('cancel'))
 
-    node.submit()
+    const taskId = node.submit()
+    expect(taskId).toBe(1)
     expect(order).toEqual(['submit:first', 'submit:second', 'cancel'])
 
-    await flush()
+    await runtime.closed
     expect(order).not.toContain('handler')
   })
 
-  it('accepts nothing when the runtime starts aborted', () => {
+  it('starts closed and creates no nodes when its signal is already aborted', async () => {
     const abortController = new AbortController()
     abortController.abort()
     const runtime = new Runtime({ concurrency: 1, signal: abortController.signal })
-    const events: string[] = []
-    const node = runtime.node(async () => void events.push('handler'))
-    node.on('task:submit', () => events.push('submit'))
 
-    node.submit()
-    expect(events).toEqual([])
+    expect(() => runtime.node(async () => {})).toThrow(
+      'Cannot create a task node after the runtime stops accepting work',
+    )
+    await expect(runtime.closed).resolves.toBeUndefined()
   })
 
   it('cancels tasks that never started while a running handler settles normally', async () => {
@@ -251,8 +301,9 @@ describe('Runtime abort', () => {
     node.submit(2)
     await flush()
     abortController.abort()
+    expect(node.submit(3)).toBeUndefined()
     release()
-    await flush()
+    await runtime.closed
 
     expect(started).toEqual([0])
     expect(cancelled).toEqual([1, 2])
@@ -276,7 +327,7 @@ describe('Runtime abort', () => {
     abortController.abort()
     const boom = new Error('late boom')
     reject(boom)
-    await flush()
+    await runtime.closed
 
     expect(failures).toEqual([boom])
   })

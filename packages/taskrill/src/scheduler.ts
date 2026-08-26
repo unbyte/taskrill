@@ -30,12 +30,14 @@ export function assertValidConcurrency(value: number, label = 'concurrency') {
   }
 }
 
-/** Global FIFO dispatcher and owner of task acceptance, abort, and idle accounting. */
+/** Global FIFO dispatcher and owner of task acceptance, closure, abort, and idle accounting. */
 export class Scheduler implements JobQueue {
   readonly context: TaskContext
+  readonly closed: Promise<void>
 
   private readonly queue = new FifoQueue<Job>()
   private readonly abortableQueues = new Set<AbortableQueue>()
+  private resolveClosed?: () => void
   private nextTaskId = 1
   private pendingTasks = 0
   private runningJobs = 0
@@ -46,6 +48,8 @@ export class Scheduler implements JobQueue {
   private lifecycleDepth = 0
   private abortRequested = false
   private aborting = false
+  private acceptingWork = true
+  private readonly onAbort = () => this.requestAbort()
 
   constructor(
     private readonly concurrency: number,
@@ -54,10 +58,20 @@ export class Scheduler implements JobQueue {
   ) {
     assertValidConcurrency(concurrency)
     this.context = { signal: signal ?? NEVER_ABORT }
+    this.closed = new Promise((resolve) => {
+      this.resolveClosed = resolve
+    })
 
-    if (signal && !signal.aborted) {
-      signal.addEventListener('abort', () => this.requestAbort(), { once: true })
+    if (signal?.aborted) {
+      this.acceptingWork = false
+      this.finishClose()
+    } else if (signal) {
+      signal.addEventListener('abort', this.onAbort, { once: true })
     }
+  }
+
+  get accepting() {
+    return this.acceptingWork
   }
 
   get aborted() {
@@ -65,14 +79,23 @@ export class Scheduler implements JobQueue {
   }
 
   accept(queue: JobQueue, createTask: (id: number) => TaskDefinition) {
-    if (this.aborted) return
+    if (!this.acceptingWork) return undefined
 
-    const task = createTask(this.nextTaskId++)
+    const id = this.nextTaskId++
+    const task = createTask(id)
     this.pendingTasks++
     this.activityGeneration++
     this.idleCandidateGeneration = undefined
     queue.enqueue(this.track(task.job))
     this.emitLifecycle(task.publish)
+    return id
+  }
+
+  close() {
+    if (!this.acceptingWork) return
+
+    this.acceptingWork = false
+    this.finishClose()
   }
 
   enqueue(job: Job) {
@@ -118,6 +141,7 @@ export class Scheduler implements JobQueue {
       finished = true
       this.pendingTasks--
       if (this.pendingTasks === 0) this.idleCandidateGeneration = this.activityGeneration
+      this.finishClose()
     }
 
     return {
@@ -139,6 +163,7 @@ export class Scheduler implements JobQueue {
   }
 
   private requestAbort() {
+    this.acceptingWork = false
     this.abortRequested = true
     this.flushAbort()
   }
@@ -192,6 +217,15 @@ export class Scheduler implements JobQueue {
     this.runningJobs--
     this.schedulePump()
     this.scheduleIdleCheckpoint()
+    this.finishClose()
+  }
+
+  private finishClose() {
+    if (this.acceptingWork || this.pendingTasks !== 0 || this.runningJobs !== 0) return
+
+    this.signal?.removeEventListener('abort', this.onAbort)
+    this.resolveClosed?.()
+    this.resolveClosed = undefined
   }
 
   private scheduleIdleCheckpoint() {

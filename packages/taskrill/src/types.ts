@@ -5,7 +5,7 @@ export type Unsubscribe = () => void
 export interface RuntimeOptions {
   /** Maximum handlers running across the runtime. Must be a positive integer or `Infinity`. */
   concurrency: number
-  /** Once aborted, queued tasks are cancelled and future submissions are ignored. */
+  /** Aborting closes the runtime, cancels queued tasks, and signals running handlers. */
   signal?: AbortSignal
 }
 
@@ -21,6 +21,7 @@ export interface TaskContext {
   readonly signal: AbortSignal
 }
 
+/** A thrown or rejected value reports task failure without stopping the runtime. */
 export type Handler<I> = (input: I, context: TaskContext) => MaybePromise<void>
 
 export interface TaskNodeRef {
@@ -76,8 +77,8 @@ export interface RuntimeEventMap {
 }
 
 export interface TaskNode<I = void> extends TaskNodeRef {
-  /** Accepts a task for deferred execution. A submission after abort is ignored. */
-  submit(...args: SubmitArgs<I>): void
+  /** Accepts a task and returns its ID, or `undefined` when the runtime no longer accepts work. */
+  submit(...args: SubmitArgs<I>): number | undefined
 
   on<K extends keyof TaskNodeEventMap<I>>(
     event: K,
