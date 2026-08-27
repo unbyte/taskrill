@@ -83,4 +83,55 @@ describe('Gate', () => {
     expect(started).toEqual([0, 1])
     expect(cancelled).toEqual([2, 3, 4, 5])
   })
+
+  it('cancels a job immediately when it is enqueued after abort', async () => {
+    const abortController = new AbortController()
+    const scheduler = new Scheduler(1, abortController.signal, new Emitter())
+    const gate = new Gate(scheduler, 1)
+    let ran = false
+    let cancelled = false
+
+    abortController.abort()
+    await scheduler.closed
+    gate.enqueue({
+      run: async () => {
+        ran = true
+      },
+      cancel: () => {
+        cancelled = true
+      },
+    })
+
+    expect(ran).toBe(false)
+    expect(cancelled).toBe(true)
+  })
+
+  it('cancels jobs forwarded to the scheduler as well as jobs still buffered', async () => {
+    const abortController = new AbortController()
+    const scheduler = new Scheduler(1, abortController.signal, new Emitter())
+    const gate = new Gate(scheduler, 1)
+    const cancelled: number[] = []
+    let release!: () => void
+    const blocker = new Promise<void>((resolve) => {
+      release = resolve
+    })
+
+    scheduler.accept(scheduler, () => ({
+      job: { run: () => blocker, cancel: () => {} },
+      publish: () => {},
+    }))
+    for (const id of [1, 2]) {
+      scheduler.accept(gate, () => ({
+        job: { run: async () => {}, cancel: () => cancelled.push(id) },
+        publish: () => {},
+      }))
+    }
+
+    await flush()
+    abortController.abort()
+    release()
+    await scheduler.closed
+
+    expect(cancelled).toEqual([2, 1])
+  })
 })

@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { Emitter } from './emitter'
 import { type Job, Scheduler } from './scheduler'
 import type { RuntimeEventMap } from './types'
@@ -169,5 +169,75 @@ describe('Scheduler', () => {
     expect(taskId).toBeUndefined()
     expect(created).toBe(false)
     await expect(scheduler.closed).resolves.toBeUndefined()
+  })
+
+  it('immediately cancels queues registered after abort', async () => {
+    const abortController = new AbortController()
+    const scheduler = new Scheduler(1, abortController.signal, new Emitter())
+    let jobRan = false
+    let jobCancelled = false
+    let queueAborted = false
+
+    abortController.abort()
+    await scheduler.closed
+    scheduler.enqueue({
+      run: async () => {
+        jobRan = true
+      },
+      cancel: () => {
+        jobCancelled = true
+      },
+    })
+    const unregister = scheduler.registerAbortable({
+      abort: () => {
+        queueAborted = true
+      },
+    })
+    unregister()
+
+    expect(jobRan).toBe(false)
+    expect(jobCancelled).toBe(true)
+    expect(queueAborted).toBe(true)
+  })
+
+  it('releases capacity and surfaces an unexpected job rejection asynchronously', async () => {
+    const scheduler = new Scheduler(1, undefined, new Emitter())
+    const ran: number[] = []
+    let reject!: (error: unknown) => void
+    const running = new Promise<void>((_resolve, rejectPromise) => {
+      reject = rejectPromise
+    })
+
+    accept(scheduler, { run: () => running, cancel: () => {} })
+    accept(
+      scheduler,
+      immediateJob(() => ran.push(2)),
+    )
+    await flush()
+
+    const microtasks: Array<() => void> = []
+    const queueMicrotaskSpy = vi
+      .spyOn(globalThis, 'queueMicrotask')
+      .mockImplementation((callback) => {
+        microtasks.push(callback)
+      })
+    const error = new Error('unexpected job rejection')
+
+    try {
+      reject(error)
+      await flush()
+
+      const pump = microtasks.shift()
+      const surfaceError = microtasks.shift()
+      if (!pump || !surfaceError) throw new Error('Expected scheduler recovery microtasks')
+
+      pump()
+      await flush()
+
+      expect(ran).toEqual([2])
+      expect(surfaceError).toThrow(error)
+    } finally {
+      queueMicrotaskSpy.mockRestore()
+    }
   })
 })

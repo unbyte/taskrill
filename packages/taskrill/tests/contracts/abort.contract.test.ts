@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest'
-import { Runtime } from '../src'
-import { deferred, flush, runToIdle } from './e2e-helpers'
+import { Runtime } from '../../src'
+import { deferred, flush, runToIdle } from '../e2e-helpers'
 
-describe('e2e: abort and runtime closure', () => {
+describe('contract: abort and runtime closure', () => {
   it('closes when external code aborts after the workload has become idle', async () => {
     const abortController = new AbortController()
     const runtime = new Runtime({ concurrency: 2, signal: abortController.signal })

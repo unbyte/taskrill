@@ -47,6 +47,43 @@ describe('Runtime nodes', () => {
     expect(seen).toEqual([1, 2, 3])
   })
 
+  it('does not let a node concurrency option widen the runtime limit', async () => {
+    const runtime = new Runtime({ concurrency: 2 })
+    const releases: Array<() => void> = []
+    let active = 0
+    let completed = 0
+    let peak = 0
+    const node = runtime.node(
+      async () => {
+        active++
+        peak = Math.max(peak, active)
+        await new Promise<void>((resolve) => {
+          releases.push(() => {
+            active--
+            completed++
+            resolve()
+          })
+        })
+      },
+      { concurrency: 10 },
+    )
+    const idle = runToIdle(runtime, () => {
+      for (let index = 0; index < 4; index++) node.submit()
+    })
+
+    await flush()
+    expect(active).toBe(2)
+
+    while (completed < 4) {
+      const current = releases.splice(0)
+      for (const release of current) release()
+      await flush()
+    }
+    await idle
+
+    expect(peak).toBe(2)
+  })
+
   it('passes the runtime signal or a never-aborting placeholder to handlers', async () => {
     const abortController = new AbortController()
     const withSignal = new Runtime({ concurrency: 1, signal: abortController.signal })

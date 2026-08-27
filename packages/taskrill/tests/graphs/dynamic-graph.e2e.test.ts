@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { Runtime } from '../src'
+import { Runtime } from '../../src'
 
 const runToIdle = (runtime: Runtime, start: () => void) =>
   new Promise<void>((resolve) => {

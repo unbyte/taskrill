@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { Runtime } from '../src'
+import { Runtime } from '../../src'
 
 describe('e2e: pipelines and diamonds', () => {
   it('runs several correlated inputs through a linear pipeline', async () => {

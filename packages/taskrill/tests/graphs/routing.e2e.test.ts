@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { Runtime } from '../src'
+import { Runtime } from '../../src'
 
 describe('e2e: conditional and dynamic routing', () => {
   it('routes each input through exactly one conditional branch', async () => {

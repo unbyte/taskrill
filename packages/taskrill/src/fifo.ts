@@ -32,7 +32,6 @@ export class FifoQueue<T extends object> {
   }
 
   private compact() {
-    if (this.head === 0) return
     if (this.head >= this.items.length) {
       this.items.length = 0
       this.head = 0

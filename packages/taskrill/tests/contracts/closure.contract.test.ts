@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest'
-import { Runtime } from '../src'
-import { deferred } from './e2e-helpers'
+import { Runtime } from '../../src'
+import { deferred } from '../e2e-helpers'
 
-describe('e2e: application-controlled runtime closure', () => {
+describe('contract: application-controlled runtime closure', () => {
   it('stays reusable across idle periods until application state chooses to close', async () => {
     const runtime = new Runtime({ concurrency: 2 })
     const firstIdle = deferred()

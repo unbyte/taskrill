@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { Runtime } from '../src'
+import { Runtime } from '../../src'
 
 describe('e2e: failure recovery', () => {
   it('retries failed executions through application state before continuing downstream', async () => {

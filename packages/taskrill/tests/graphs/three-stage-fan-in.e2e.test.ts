@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
-import type { Handler, TaskNode } from '../src'
-import { Runtime } from '../src'
-import { deferred } from './e2e-helpers'
+import type { Handler, TaskNode } from '../../src'
+import { Runtime } from '../../src'
+import { deferred } from '../e2e-helpers'
 
 type Stage = 'first' | 'second' | 'third'
 
