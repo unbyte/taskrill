@@ -13,7 +13,7 @@ import type {
 
 /** One scheduling environment shared by a dynamic graph of reusable task nodes. */
 export class Runtime {
-  /** Resolves after acceptance stops and every task terminates. Task failures do not reject it. */
+  /** Stable promise for shutdown; it remains awaitable after resolving and never rejects on task failure. */
   readonly closed: Promise<void>
 
   private readonly events = new Emitter<RuntimeEventMap>()

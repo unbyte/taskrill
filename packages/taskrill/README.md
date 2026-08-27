@@ -87,7 +87,7 @@ different nodes are correlated or which outcomes satisfy a dependency.
 | `runtime.on('task:failure', listener)` | Observes failures from every node for logging or runtime-wide policy. |
 | `runtime.on('idle', listener)` | Observes multi-shot transitions to zero pending tasks. Idleness is not graph completion. |
 | `runtime.close()` | Stops accepting new work while allowing accepted tasks to terminate normally. |
-| `runtime.closed` | Resolves after close or abort once every accepted task has terminated. |
+| `runtime.closed` | Stable promise that resolves after close or abort once every accepted task has terminated; it may be awaited after shutdown. |
 
 Use application state to decide when the graph is logically complete, then call
 `runtime.close()`—often from an `idle` listener—and await `runtime.closed` when

@@ -247,6 +247,30 @@ describe('Runtime idle', () => {
 })
 
 describe('Runtime abort', () => {
+  it('lets external code await closure after abort interrupts a running handler', async () => {
+    const abortController = new AbortController()
+    const runtime = new Runtime({ concurrency: 1, signal: abortController.signal })
+    let started!: () => void
+    const handlerStarted = new Promise<void>((resolve) => {
+      started = resolve
+    })
+    const node = runtime.node(async (_input, { signal }) => {
+      started()
+      await new Promise<void>((_resolve, reject) => {
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true })
+      })
+    })
+    const failures: unknown[] = []
+    runtime.on('task:failure', ({ error }) => failures.push(error))
+
+    node.submit()
+    await handlerStarted
+    abortController.abort('interrupted')
+
+    await expect(runtime.closed).resolves.toBeUndefined()
+    expect(failures).toEqual(['interrupted'])
+  })
+
   it('preserves submit-before-cancel ordering when a submit listener aborts', async () => {
     const abortController = new AbortController()
     const runtime = new Runtime({ concurrency: 1, signal: abortController.signal })
