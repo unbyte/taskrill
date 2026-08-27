@@ -178,6 +178,7 @@ export class Scheduler implements JobQueue {
     } finally {
       this.abortRequested = false
       this.aborting = false
+      this.finishClose()
     }
   }
 

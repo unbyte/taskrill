@@ -247,6 +247,21 @@ describe('Runtime idle', () => {
 })
 
 describe('Runtime abort', () => {
+  it('closes when an already idle runtime is aborted', async () => {
+    const abortController = new AbortController()
+    const runtime = new Runtime({ concurrency: 1, signal: abortController.signal })
+    const Task = runtime.node(async () => {})
+
+    await runToIdle(runtime, () => Task.submit())
+    abortController.abort()
+
+    const observed = await Promise.race([
+      runtime.closed.then(() => 'closed' as const),
+      flush().then(() => 'timeout' as const),
+    ])
+    expect(observed).toBe('closed')
+  })
+
   it('lets external code await closure after abort interrupts a running handler', async () => {
     const abortController = new AbortController()
     const runtime = new Runtime({ concurrency: 1, signal: abortController.signal })

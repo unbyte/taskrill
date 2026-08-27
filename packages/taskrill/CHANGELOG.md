@@ -6,6 +6,7 @@
 - Replaced aggregate settlements and joins with synchronous lifecycle events and runtime idleness.
 - Task submissions now return their runtime-wide task ID, or `undefined` when the runtime no longer accepts work.
 - Added graceful runtime closure and an awaitable `closed` lifecycle that does not aggregate or reject on task failures.
+- Fixed `runtime.closed` remaining pending when the runtime was aborted after becoming idle.
 
 ## 0.1.0
 

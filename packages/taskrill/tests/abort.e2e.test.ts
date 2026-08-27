@@ -1,8 +1,26 @@
 import { describe, expect, it } from 'vitest'
 import { Runtime } from '../src'
-import { deferred, flush } from './e2e-helpers'
+import { deferred, flush, runToIdle } from './e2e-helpers'
 
 describe('e2e: abort and runtime closure', () => {
+  it('closes when external code aborts after the workload has become idle', async () => {
+    const abortController = new AbortController()
+    const runtime = new Runtime({ concurrency: 2, signal: abortController.signal })
+    const completed: string[] = []
+    const Task = runtime.node<string>(async (input) => void completed.push(input))
+
+    await runToIdle(runtime, () => {
+      Task.submit('first')
+      Task.submit('second')
+    })
+    expect(completed).toEqual(['first', 'second'])
+
+    abortController.abort()
+    await runtime.closed
+
+    expect(Task.submit('rejected')).toBeUndefined()
+  })
+
   it('allows closure to be awaited after an interrupted handler has already terminated', async () => {
     const abortController = new AbortController()
     const runtime = new Runtime({ concurrency: 1, signal: abortController.signal })
