@@ -1,387 +1,410 @@
 import { describe, expect, it } from 'vitest'
-import { SealedUnitError } from './errors'
-import { join } from './join'
 import { Runtime } from './runtime'
 
-const flush = () => new Promise((resolve) => setTimeout(resolve, 0))
+const flush = () => new Promise<void>((resolve) => setTimeout(resolve, 0))
 
-describe('Runtime construction', () => {
-  it('validates concurrency at construction', () => {
-    expect(() => new Runtime({ concurrency: 0 })).toThrow(RangeError)
-    expect(() => new Runtime({ concurrency: -1 })).toThrow(RangeError)
-    expect(() => new Runtime({ concurrency: 1.5 })).toThrow(RangeError)
-    expect(() => new Runtime({ concurrency: Number.NaN })).toThrow(RangeError)
-    expect(() => new Runtime({ concurrency: 1 })).not.toThrow()
-    expect(() => new Runtime({ concurrency: Number.POSITIVE_INFINITY })).not.toThrow()
+const runToIdle = (runtime: Runtime, start: () => void) =>
+  new Promise<void>((resolve) => {
+    const unsubscribe = runtime.on('idle', () => {
+      unsubscribe()
+      resolve()
+    })
+    start()
   })
 
-  it('assigns monotonic ids and default kind#id names', () => {
+describe('Runtime nodes', () => {
+  it('assigns monotonic node IDs and generated names', () => {
     const runtime = new Runtime({ concurrency: 1 })
-    const a = runtime.single(async () => {})
-    const b = runtime.group(async () => {})
-    const c = runtime.group(async () => {}, { name: 'D' })
-    expect([a.id, b.id, c.id]).toEqual([1, 2, 3])
-    expect(a.name).toBe('single#1')
-    expect(b.name).toBe('group#2')
-    expect(c.name).toBe('D')
-  })
-})
+    const first = runtime.node(async () => {})
+    const second = runtime.node<number>(async () => {}, { name: 'Second' })
 
-describe('Runtime scheduling', () => {
-  it('never runs a handler inline during submit', () => {
-    const runtime = new Runtime({ concurrency: 1 })
-    let ran = false
-    const single = runtime.single(() => {
-      ran = true
-    })
-    single.submit()
-    expect(ran).toBe(false)
+    expect(first).toMatchObject({ id: 1, name: 'node#1' })
+    expect(second).toMatchObject({ id: 2, name: 'Second' })
+    expect(first).not.toHaveProperty('done')
+    expect(first).not.toHaveProperty('seal')
   })
 
-  it('caps concurrent handlers across the whole runtime', async () => {
-    const runtime = new Runtime({ concurrency: 3 })
-    let active = 0
-    let peak = 0
-    const release: Array<() => void> = []
-    const group = runtime.group<number>(async () => {
-      active++
-      peak = Math.max(peak, active)
-      await new Promise<void>((resolve) =>
-        release.push(() => {
-          active--
-          resolve()
-        }),
-      )
-    })
-
-    for (let i = 0; i < 9; i++) group.submit(i)
-    group.seal()
-
-    await flush()
-    expect(active).toBe(3)
-
-    for (let i = 0; i < 9; i++) {
-      release.shift()?.()
-      await flush()
-    }
-
-    await expect(group.done).resolves.toEqual({ submitted: 9, succeeded: 9, failed: 0, cancelled: 0, ok: true })
-    expect(peak).toBe(3)
+  it('validates node concurrency without consuming a node ID', () => {
+    const runtime = new Runtime({ concurrency: 4 })
+    expect(() => runtime.node(async () => {}, { concurrency: 0 })).toThrow(RangeError)
+    expect(() => runtime.node(async () => {}, { concurrency: -1 })).toThrow(RangeError)
+    expect(() => runtime.node(async () => {}, { concurrency: 1.5 })).toThrow(RangeError)
+    expect(() => runtime.node(async () => {}, { concurrency: Number.NaN })).toThrow(RangeError)
+    expect(runtime.node(async () => {}).id).toBe(1)
   })
 
-  it('resolves done asynchronously even when a unit settles synchronously', async () => {
-    const runtime = new Runtime({ concurrency: 1 })
-    const group = runtime.group(async () => {})
-    let resolved = false
-    group.done.then(() => {
-      resolved = true
-    })
-    group.seal()
-    expect(resolved).toBe(false)
-    await group.done
-    expect(resolved).toBe(true)
-  })
-})
-
-describe('Runtime signal', () => {
-  it('passes the runtime signal to every handler', async () => {
-    const ac = new AbortController()
-    const runtime = new Runtime({ concurrency: 1, signal: ac.signal })
-    let got: AbortSignal | undefined
-    const single = runtime.single((_input, ctx) => {
-      got = ctx.signal
-    })
-    single.submit()
-    await single.done
-    expect(got).toBe(ac.signal)
-  })
-
-  it('provides a never-aborting placeholder when no signal is given', async () => {
-    const runtime = new Runtime({ concurrency: 1 })
-    let got: AbortSignal | undefined
-    const single = runtime.single((_input, ctx) => {
-      got = ctx.signal
-    })
-    single.submit()
-    await single.done
-    expect(got).toBeInstanceOf(AbortSignal)
-    expect(got?.aborted).toBe(false)
-  })
-})
-
-describe('Runtime errors', () => {
-  it('reports each failed task exactly once with unit and input', async () => {
-    const failures: Array<{ error: unknown; name: string; input: unknown }> = []
-    const runtime = new Runtime({
-      concurrency: 2,
-      onError: ({ error, unit, input }) => failures.push({ error, name: unit.name, input }),
-    })
-    const boom = new Error('boom')
-    const group = runtime.group<number>(
-      async (x) => {
-        if (x === 2) throw boom
-      },
-      { name: 'G' },
-    )
-    group.submit(1)
-    group.submit(2)
-    group.submit(3)
-    group.seal()
-
-    const settlement = await group.done
-    expect(settlement).toEqual({ submitted: 3, succeeded: 2, failed: 1, cancelled: 0, ok: false })
-    expect(failures).toEqual([{ error: boom, name: 'G', input: 2 }])
-  })
-
-  it('never rejects done even when a handler throws', async () => {
-    const runtime = new Runtime({ concurrency: 1 })
-    const single = runtime.single(async () => {
-      throw new Error('boom')
-    })
-    single.submit()
-    await expect(single.done).resolves.toMatchObject({ failed: 1, ok: false })
-  })
-})
-
-describe('Runtime cancellation', () => {
-  it('cancels queued tasks and lets running tasks finish naturally on abort', async () => {
-    const ac = new AbortController()
-    const runtime = new Runtime({ concurrency: 2, signal: ac.signal })
-    let release!: () => void
-    const gate = new Promise<void>((resolve) => {
-      release = resolve
-    })
-    const started: number[] = []
-    const group = runtime.group<number>(async (x) => {
-      started.push(x)
-      await gate
-    })
-
-    for (let i = 0; i < 5; i++) group.submit(i)
-    await flush()
-    expect(started).toHaveLength(2)
-
-    ac.abort()
-    release()
-
-    await expect(group.done).resolves.toEqual({ submitted: 5, succeeded: 2, failed: 0, cancelled: 3, ok: false })
-    expect(started).toHaveLength(2)
-  })
-
-  it('still fires onError for a running task that rejects after abort', async () => {
-    const ac = new AbortController()
-    const errors: unknown[] = []
-    const runtime = new Runtime({ concurrency: 1, signal: ac.signal, onError: ({ error }) => errors.push(error) })
-    let rejectGate!: (reason: unknown) => void
-    const gate = new Promise<void>((_resolve, reject) => {
-      rejectGate = reject
-    })
-    const group = runtime.group<number>(async () => {
-      await gate
-    })
-    group.submit(1)
-    group.submit(2)
-    await flush()
-
-    ac.abort()
-    const boom = new Error('late boom')
-    rejectGate(boom)
-
-    await expect(group.done).resolves.toEqual({ submitted: 2, succeeded: 0, failed: 1, cancelled: 1, ok: false })
-    expect(errors).toEqual([boom])
-  })
-
-  it('force-seals unsealed units on abort so their done resolves', async () => {
-    const ac = new AbortController()
-    const runtime = new Runtime({ concurrency: 1, signal: ac.signal })
-    const group = runtime.group<number>(async () => {}) // never sealed by wiring
-    ac.abort()
-    await expect(group.done).resolves.toEqual({ submitted: 0, succeeded: 0, failed: 0, cancelled: 0, ok: true })
-  })
-
-  it('drops submit() after abort but throws after an application seal', () => {
-    const ac = new AbortController()
-    const aborted = new Runtime({ concurrency: 1, signal: ac.signal })
-    const g1 = aborted.group<number>(async () => {})
-    ac.abort()
-    expect(() => g1.submit(1)).not.toThrow()
-
-    const plain = new Runtime({ concurrency: 1 })
-    const g2 = plain.group<number>(async () => {})
-    g2.seal()
-    expect(() => g2.submit(1)).toThrow(SealedUnitError)
-  })
-
-  it('supports fail-fast by aborting from onError', async () => {
-    const ac = new AbortController()
+  it('accepts repeated submissions to the same reusable node', async () => {
+    const runtime = new Runtime({ concurrency: 2 })
     const seen: number[] = []
-    const runtime = new Runtime({
-      concurrency: 1,
-      signal: ac.signal,
-      onError: ({ error }) => ac.abort(error),
-    })
-    const group = runtime.group<number>(async (x) => {
-      seen.push(x)
-      if (x === 0) throw new Error('boom')
-    })
-    group.submit(0)
-    group.submit(1)
-    group.submit(2)
+    const node = runtime.node<number>(async (input) => void seen.push(input))
+    let taskIds: Array<number | undefined> = []
 
-    const settlement = await group.done
-    expect(seen).toEqual([0])
-    expect(settlement).toMatchObject({ submitted: 3, failed: 1, cancelled: 2, ok: false })
-    expect(ac.signal.reason).toBeInstanceOf(Error)
+    await runToIdle(runtime, () => {
+      taskIds = [node.submit(1), node.submit(2), node.submit(3)]
+    })
+
+    expect(taskIds).toEqual([1, 2, 3])
+    expect(seen).toEqual([1, 2, 3])
   })
-})
 
-describe('Runtime group concurrency', () => {
-  /** A group handler that stays active until its pushed release is called. */
-  const blockingGroup = (runtime: Runtime, concurrency?: number) => {
+  it('does not let a node concurrency option widen the runtime limit', async () => {
+    const runtime = new Runtime({ concurrency: 2 })
+    const releases: Array<() => void> = []
     let active = 0
+    let completed = 0
     let peak = 0
-    const release: Array<() => void> = []
-    const group = runtime.group<number>(
+    const node = runtime.node(
       async () => {
         active++
         peak = Math.max(peak, active)
-        await new Promise<void>((resolve) =>
-          release.push(() => {
+        await new Promise<void>((resolve) => {
+          releases.push(() => {
             active--
+            completed++
             resolve()
-          }),
-        )
+          })
+        })
       },
-      concurrency === undefined ? undefined : { concurrency },
+      { concurrency: 10 },
     )
-    return {
-      group,
-      release,
-      get active() {
-        return active
-      },
-      get peak() {
-        return peak
-      },
-    }
-  }
-
-  it('caps one group below the runtime concurrency', async () => {
-    const runtime = new Runtime({ concurrency: 5 })
-    const g = blockingGroup(runtime, 2)
-
-    for (let i = 0; i < 6; i++) g.group.submit(i)
-    g.group.seal()
+    const idle = runToIdle(runtime, () => {
+      for (let index = 0; index < 4; index++) node.submit()
+    })
 
     await flush()
-    expect(g.active).toBe(2) // held to the group's own limit, not the runtime's 5
+    expect(active).toBe(2)
 
-    for (let i = 0; i < 6; i++) {
-      g.release.shift()?.()
+    while (completed < 4) {
+      const current = releases.splice(0)
+      for (const release of current) release()
       await flush()
     }
+    await idle
 
-    await expect(g.group.done).resolves.toEqual({ submitted: 6, succeeded: 6, failed: 0, cancelled: 0, ok: true })
-    expect(g.peak).toBe(2)
+    expect(peak).toBe(2)
   })
 
-  it('limits a group even when the runtime concurrency is unbounded', async () => {
-    const runtime = new Runtime({ concurrency: Number.POSITIVE_INFINITY })
-    const g = blockingGroup(runtime, 3)
+  it('passes the runtime signal or a never-aborting placeholder to handlers', async () => {
+    const abortController = new AbortController()
+    const withSignal = new Runtime({ concurrency: 1, signal: abortController.signal })
+    const withoutSignal = new Runtime({ concurrency: 1 })
+    let observedSignal: AbortSignal | undefined
+    let placeholder: AbortSignal | undefined
 
-    for (let i = 0; i < 10; i++) g.group.submit(i)
-    g.group.seal()
+    await Promise.all([
+      runToIdle(withSignal, () =>
+        withSignal
+          .node((_input, context) => {
+            observedSignal = context.signal
+          })
+          .submit(),
+      ),
+      runToIdle(withoutSignal, () =>
+        withoutSignal
+          .node((_input, context) => {
+            placeholder = context.signal
+          })
+          .submit(),
+      ),
+    ])
 
-    await flush()
-    expect(g.active).toBe(3)
+    expect(observedSignal).toBe(abortController.signal)
+    expect(placeholder).toBeInstanceOf(AbortSignal)
+    expect(placeholder?.aborted).toBe(false)
+  })
+})
 
-    for (let i = 0; i < 10; i++) {
-      g.release.shift()?.()
-      await flush()
-    }
+describe('Task lifecycle events', () => {
+  it('emits submit synchronously and defers start and handler execution', async () => {
+    const runtime = new Runtime({ concurrency: 1 })
+    const order: string[] = []
+    const node = runtime.node<number>(async () => void order.push('handler'))
+    node.on('task:submit', () => order.push('submit'))
+    node.on('task:start', () => order.push('start'))
+    node.on('task:complete', () => order.push('complete'))
 
-    await expect(g.group.done).resolves.toMatchObject({ submitted: 10, succeeded: 10, ok: true })
-    expect(g.peak).toBe(3)
+    const idle = runToIdle(runtime, () => node.submit(7))
+    expect(order).toEqual(['submit'])
+
+    await idle
+    expect(order).toEqual(['submit', 'start', 'handler', 'complete'])
   })
 
-  it('clips a group concurrency at or above the runtime cap to no extra limit', async () => {
+  it('carries stable IDs, node identity, and typed input through a task lifecycle', async () => {
     const runtime = new Runtime({ concurrency: 2 })
-    const g = blockingGroup(runtime, 5) // >= runtime: the global cap already dominates
+    const events: Array<{ event: string; id: number; input: string }> = []
+    const node = runtime.node<string>(async () => {})
+    let taskIds: Array<number | undefined> = []
 
-    for (let i = 0; i < 6; i++) g.group.submit(i)
-    g.group.seal()
-
-    await flush()
-    expect(g.active).toBe(2)
-
-    for (let i = 0; i < 6; i++) {
-      g.release.shift()?.()
-      await flush()
+    for (const event of ['task:submit', 'task:start', 'task:complete'] as const) {
+      node.on(event, (task) => {
+        expect(task.node).toBe(node)
+        events.push({ event, id: task.id, input: task.input })
+      })
     }
 
-    await expect(g.group.done).resolves.toMatchObject({ submitted: 6, succeeded: 6, ok: true })
-    expect(g.peak).toBe(2)
+    await runToIdle(runtime, () => {
+      taskIds = [node.submit('first'), node.submit('second')]
+    })
+
+    expect(taskIds).toEqual([1, 2])
+    expect(events).toEqual([
+      { event: 'task:submit', id: 1, input: 'first' },
+      { event: 'task:submit', id: 2, input: 'second' },
+      { event: 'task:start', id: 1, input: 'first' },
+      { event: 'task:start', id: 2, input: 'second' },
+      { event: 'task:complete', id: 1, input: 'first' },
+      { event: 'task:complete', id: 2, input: 'second' },
+    ])
   })
 
-  it('gives each group an independent limit that shares the runtime cap', async () => {
-    const runtime = new Runtime({ concurrency: 4 })
-    const a = blockingGroup(runtime, 1)
-    const b = blockingGroup(runtime, 1)
+  it('reports synchronous and asynchronous handler failures exactly once', async () => {
+    const runtime = new Runtime({ concurrency: 2 })
+    const nodeFailures: unknown[] = []
+    const runtimeFailures: unknown[] = []
+    const node = runtime.node<number>((input) => {
+      if (input === 1) throw new Error('sync')
+      return Promise.reject(new Error('async'))
+    })
+    node.on('task:failure', ({ error }) => nodeFailures.push(error))
+    runtime.on('task:failure', ({ error }) => runtimeFailures.push(error))
 
-    for (let i = 0; i < 3; i++) a.group.submit(i)
-    for (let i = 0; i < 3; i++) b.group.submit(i)
-    a.group.seal()
-    b.group.seal()
+    await runToIdle(runtime, () => {
+      node.submit(1)
+      node.submit(2)
+    })
+
+    expect(nodeFailures.map((error) => (error as Error).message)).toEqual(['sync', 'async'])
+    expect(runtimeFailures).toEqual(nodeFailures)
+  })
+
+  it('emits node failure before runtime failure', async () => {
+    const runtime = new Runtime({ concurrency: 1 })
+    const order: string[] = []
+    const node = runtime.node(async () => {
+      throw new Error('boom')
+    })
+    node.on('task:failure', () => order.push('node'))
+    runtime.on('task:failure', () => order.push('runtime'))
+
+    await runToIdle(runtime, () => node.submit())
+    expect(order).toEqual(['node', 'runtime'])
+  })
+})
+
+describe('Runtime close', () => {
+  it('runs accepted work but rejects later nodes and submissions', async () => {
+    const runtime = new Runtime({ concurrency: 1 })
+    const completed: number[] = []
+    const cancelled: number[] = []
+    const node = runtime.node<number>(async (input) => void completed.push(input))
+    node.on('task:cancel', ({ input }) => cancelled.push(input))
+
+    expect(node.submit(1)).toBe(1)
+    expect(node.submit(2)).toBe(2)
+    runtime.close()
+
+    expect(node.submit(3)).toBeUndefined()
+    expect(() => runtime.node(async () => {})).toThrow(
+      'Cannot create a task node after the runtime stops accepting work',
+    )
+
+    await runtime.closed
+    expect(completed).toEqual([1, 2])
+    expect(cancelled).toEqual([])
+  })
+
+  it('resolves for an empty runtime and is idempotent', async () => {
+    const runtime = new Runtime({ concurrency: 1 })
+
+    runtime.close()
+    runtime.close()
+
+    await expect(runtime.closed).resolves.toBeUndefined()
+  })
+
+  it('resolves after failure events without rejecting', async () => {
+    const runtime = new Runtime({ concurrency: 1 })
+    const order: string[] = []
+    const node = runtime.node(async () => {
+      throw new Error('expected failure')
+    })
+    node.on('task:failure', () => order.push('node failure'))
+    runtime.on('task:failure', () => order.push('runtime failure'))
+    void runtime.closed.then(() => order.push('closed'))
+
+    node.submit()
+    runtime.close()
+
+    await expect(runtime.closed).resolves.toBeUndefined()
+    expect(order).toEqual(['node failure', 'runtime failure', 'closed'])
+  })
+})
+
+describe('Runtime idle', () => {
+  it('does not fire for an initially empty runtime', async () => {
+    const runtime = new Runtime({ concurrency: 1 })
+    let idle = 0
+    runtime.on('idle', () => idle++)
 
     await flush()
-    expect(a.active).toBe(1) // each group runs one at a time...
-    expect(b.active).toBe(1) // ...but the two run in parallel under the runtime's 4
-
-    for (let i = 0; i < 3; i++) {
-      a.release.shift()?.()
-      b.release.shift()?.()
-      await flush()
-    }
-
-    await expect(join(a.group, b.group)).resolves.toMatchObject({ submitted: 6, succeeded: 6, ok: true })
-    expect(a.peak).toBe(1)
-    expect(b.peak).toBe(1)
+    expect(idle).toBe(0)
   })
 
-  it('validates group concurrency at creation', () => {
-    const runtime = new Runtime({ concurrency: 4 })
-    expect(() => runtime.group(async () => {}, { concurrency: 0 })).toThrow(RangeError)
-    expect(() => runtime.group(async () => {}, { concurrency: -1 })).toThrow(RangeError)
-    expect(() => runtime.group(async () => {}, { concurrency: 1.5 })).toThrow(RangeError)
-    expect(() => runtime.group(async () => {}, { concurrency: Number.NaN })).toThrow(RangeError)
-    expect(() => runtime.group(async () => {}, { concurrency: 2 })).not.toThrow()
-    expect(() => runtime.group(async () => {}, { concurrency: Number.POSITIVE_INFINITY })).not.toThrow()
+  it('is multi-shot and includes work submitted by an idle listener', async () => {
+    const runtime = new Runtime({ concurrency: 1 })
+    const inputs: number[] = []
+    const node = runtime.node<number>(async (input) => void inputs.push(input))
+    let idle = 0
+    runtime.on('idle', () => {
+      idle++
+      if (idle === 1) node.submit(2)
+    })
+
+    node.submit(1)
+    await flush()
+
+    expect(inputs).toEqual([1, 2])
+    expect(idle).toBe(2)
   })
 
-  it('cancels a limited group’s held-back tasks on abort and settles', async () => {
-    const ac = new AbortController()
-    const runtime = new Runtime({ concurrency: 5, signal: ac.signal })
+  it('waits for listener-submitted causal work before becoming idle', async () => {
+    const runtime = new Runtime({ concurrency: 1 })
+    const order: string[] = []
+    const downstream = runtime.node(async () => void order.push('downstream'))
+    const upstream = runtime.node(async () => void order.push('upstream'))
+    upstream.on('task:complete', () => downstream.submit())
+    runtime.on('idle', () => order.push('idle'))
+
+    upstream.submit()
+    await flush()
+
+    expect(order).toEqual(['upstream', 'downstream', 'idle'])
+  })
+})
+
+describe('Runtime abort', () => {
+  it('closes when an already idle runtime is aborted', async () => {
+    const abortController = new AbortController()
+    const runtime = new Runtime({ concurrency: 1, signal: abortController.signal })
+    const Task = runtime.node(async () => {})
+
+    await runToIdle(runtime, () => Task.submit())
+    abortController.abort()
+
+    const observed = await Promise.race([
+      runtime.closed.then(() => 'closed' as const),
+      flush().then(() => 'timeout' as const),
+    ])
+    expect(observed).toBe('closed')
+  })
+
+  it('lets external code await closure after abort interrupts a running handler', async () => {
+    const abortController = new AbortController()
+    const runtime = new Runtime({ concurrency: 1, signal: abortController.signal })
+    let started!: () => void
+    const handlerStarted = new Promise<void>((resolve) => {
+      started = resolve
+    })
+    const node = runtime.node(async (_input, { signal }) => {
+      started()
+      await new Promise<void>((_resolve, reject) => {
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true })
+      })
+    })
+    const failures: unknown[] = []
+    runtime.on('task:failure', ({ error }) => failures.push(error))
+
+    node.submit()
+    await handlerStarted
+    abortController.abort('interrupted')
+
+    await expect(runtime.closed).resolves.toBeUndefined()
+    expect(failures).toEqual(['interrupted'])
+  })
+
+  it('preserves submit-before-cancel ordering when a submit listener aborts', async () => {
+    const abortController = new AbortController()
+    const runtime = new Runtime({ concurrency: 1, signal: abortController.signal })
+    const order: string[] = []
+    const node = runtime.node(async () => void order.push('handler'))
+
+    node.on('task:submit', () => {
+      order.push('submit:first')
+      abortController.abort()
+    })
+    node.on('task:submit', () => order.push('submit:second'))
+    node.on('task:cancel', () => order.push('cancel'))
+
+    const taskId = node.submit()
+    expect(taskId).toBe(1)
+    expect(order).toEqual(['submit:first', 'submit:second', 'cancel'])
+
+    await runtime.closed
+    expect(order).not.toContain('handler')
+  })
+
+  it('starts closed and creates no nodes when its signal is already aborted', async () => {
+    const abortController = new AbortController()
+    abortController.abort()
+    const runtime = new Runtime({ concurrency: 1, signal: abortController.signal })
+
+    expect(() => runtime.node(async () => {})).toThrow(
+      'Cannot create a task node after the runtime stops accepting work',
+    )
+    await expect(runtime.closed).resolves.toBeUndefined()
+  })
+
+  it('cancels tasks that never started while a running handler settles normally', async () => {
+    const abortController = new AbortController()
+    const runtime = new Runtime({ concurrency: 1, signal: abortController.signal })
+    const started: number[] = []
+    const cancelled: number[] = []
+    const completed: number[] = []
     let release!: () => void
-    const held = new Promise<void>((resolve) => {
+    const running = new Promise<void>((resolve) => {
       release = resolve
     })
-    const started: number[] = []
-    const group = runtime.group<number>(
-      async (x) => {
-        started.push(x)
-        await held
-      },
-      { concurrency: 2 },
-    )
+    const node = runtime.node<number>(async (input) => {
+      started.push(input)
+      await running
+    })
+    node.on('task:cancel', ({ input }) => cancelled.push(input))
+    node.on('task:complete', ({ input }) => completed.push(input))
 
-    for (let i = 0; i < 6; i++) group.submit(i)
+    node.submit(0)
+    node.submit(1)
+    node.submit(2)
     await flush()
-    expect(started).toHaveLength(2) // only two started under the group's limit
-
-    ac.abort()
+    abortController.abort()
+    expect(node.submit(3)).toBeUndefined()
     release()
+    await runtime.closed
 
-    await expect(group.done).resolves.toEqual({ submitted: 6, succeeded: 2, failed: 0, cancelled: 4, ok: false })
-    expect(started).toHaveLength(2) // held-back tasks never started
+    expect(started).toEqual([0])
+    expect(cancelled).toEqual([1, 2])
+    expect(completed).toEqual([0])
+  })
+
+  it('still reports a running failure after abort and never emits idle', async () => {
+    const abortController = new AbortController()
+    const runtime = new Runtime({ concurrency: 1, signal: abortController.signal })
+    const failures: unknown[] = []
+    let reject!: (error: unknown) => void
+    const running = new Promise<void>((_resolve, rejectPromise) => {
+      reject = rejectPromise
+    })
+    const node = runtime.node(async () => running)
+    runtime.on('task:failure', ({ error }) => failures.push(error))
+    runtime.on('idle', () => failures.push('idle'))
+
+    node.submit()
+    await flush()
+    abortController.abort()
+    const boom = new Error('late boom')
+    reject(boom)
+    await runtime.closed
+
+    expect(failures).toEqual([boom])
   })
 })
